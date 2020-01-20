@@ -1,0 +1,342 @@
+* Downloading large cubes
+:PROPERTIES:
+  :header-args:sparql:    :url https://production-drafter-ons-alpha.publishmydata.com/v1/sparql/live
+  :header-args:sparql:    :format text/csv
+:END:
+
+This documents describes a generalised process to build and download a
+large RDF Datacube.  We estimate this approach should be able to
+download a large cube of 15 million observations in about 4 hours via
+a public SPARQL endpoint.
+
+** Table of Contents                                                   :TOC:
+- [[#downloading-large-cubes][Downloading large cubes]]
+  - [[#summary-of-approach][Summary of approach]]
+  - [[#assessing-the-size-of-the-problem][Assessing the size of the problem]]
+  - [[#finding-candidate-cursor-dimensions-and-components][Finding candidate cursor dimensions (and components)]]
+    - [[#finding-component-metadata-and-dimensions-to-cursor-with][Finding component metadata and dimensions to cursor with]]
+    - [[#finding-code-metadata-and-the-values-for-cursoring][Finding code metadata and the values for cursoring]]
+  - [[#using-our-cursor-to-paginate-observations][Using our cursor to paginate observations]]
+  - [[#additional-considerations][Additional considerations]]
+
+** Summary of approach
+
+The main techniques for downloading large cubes over SPARQL are:
+
+1. Avoid paginating with large =OFFSET= s which are expensive to compute
+   and will suffer from pages getting more and more expensive to
+   compute (it's N(N+1)/2!).
+2. Fetching properties and labels for reference data as pre queries
+   and joining it yourself outside of the queries for observations.
+
+In order to avoid paginating you need to find a suitable set of
+dimensions which you can use to cursor over the observations by
+dimension value, requesting slices of data; that when aggregated
+together equate to the whole cube.
+
+There are numerous trade offs here:
+
+- speed / complexity of page queries
+- wasting time querying empty parts of the cube (sparseness)
+- making fewer large queries
+- making more smaller queries
+
+We have found that without delving into advanced techniques of
+sampling cube coverage; and measuring sparseness the most general
+technique that handles the most edge cases is to:
+
+1. Pick the two dimensions with the highest cardinality (those with
+   the most distinct dimension values) as cursors.
+2. Paginating through slices of the cube by query every combination of
+   dimension-values within those two dimensions.
+
+This tends to result in lots of very simple queries that return small
+pages of data very quickly.  For any given cube there will likely be a
+faster method of obtaining all the data; but this technique should
+work on cubes ranging from the smallest to the largest with reasonable
+performance.
+
+** Assessing the size of the problem
+
+First let's just inspect how many observations we're dealing with:
+
+#+BEGIN_SRC sparql
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX qb: <http://purl.org/linked-data/cube#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX pmdqb: <http://publishmydata.com/def/qb/>
+
+SELECT (COUNT(DISTINCT ?obs) AS ?obs_count) WHERE {
+  BIND(<http://gss-data.org.uk/data/gss_data/trade/ons-trade-in-goods> AS ?dataset)
+  ?obs qb:dataSet ?dataset .
+}
+#+END_SRC
+
+#+RESULTS:
+| obs_count |
+|-----------|
+|  14799852 |
+
+
+Ok, so we have almost 15 million observations.
+
+** Finding candidate cursor dimensions (and components)
+
+NOTE: we generalise the concept of dimension to components here, so we
+can use the same queries and their metadata later.
+
+*** Finding component metadata and dimensions to cursor with
+
+We augment our [[https://www.w3.org/TR/vocab-data-cube/][RDF data cubes]] [[https://www.w3.org/TR/vocab-data-cube/#dsd][DSDs]] with an extra triple
+=pmdb:codesUsed= that exists on the component specification for each of
+the dataset's dimensions.  This triple points to a skos collection
+where the =skos:member='s are the distinct set of dimension-value
+identefiers.
+
+The following query tells us the cardinality of all component types
+(dimensions, attributes and measures (if any)).  At this stage you'll
+just be interested in the rows that have a =?comp_type= of =qb:dimension=,
+however you will also want to store the results of these queries for
+your process to use later, as they contain valuable metadata, most
+importantly the component identifiers and =rdfs:labels=.
+
+#+BEGIN_SRC sparql
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX qb: <http://purl.org/linked-data/cube#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX pmdqb: <http://publishmydata.com/def/qb/>
+
+SELECT ?component ?comp_type ?label (COUNT(?compvalue) AS ?cardinality) WHERE {
+  BIND(<http://gss-data.org.uk/data/gss_data/trade/ons-trade-in-goods> AS ?dataset)
+  #BIND(<http://gss-data.org.uk/def/dimension/trade-partner-geography> AS ?dim)
+  ?dataset qb:structure/qb:component ?compspec .
+
+  # It's not necessary to include this VALUES clause, however it's
+  # shown to illustrate how you might split and repeat as separate
+  # queries for dimensions, attributes and measures.
+  VALUES ?comp_type { qb:dimension qb:attribute qb:measure }
+
+  ?compspec ?comp_type ?component ;
+            pmdqb:codesUsed / skos:member ?compvalue .
+  ?component rdfs:label ?label .
+
+} GROUP BY ?component ?comp_type ?label ORDER BY DESC(?cardinality)
+#+END_SRC
+
+#+RESULTS:
+| component                                                    | comp_type                                  | label                   | cardinality |
+|--------------------------------------------------------------+--------------------------------------------+-------------------------+-------------|
+| http://purl.org/linked-data/sdmx/2009/dimension#refPeriod    | http://purl.org/linked-data/cube#dimension | Reference Period        |         251 |
+| http://gss-data.org.uk/def/dimension/trade-partner-geography | http://purl.org/linked-data/cube#dimension | Trade Partner Geography |         237 |
+| http://gss-data.org.uk/def/dimension/product                 | http://purl.org/linked-data/cube#dimension | Product                 |         125 |
+| http://gss-data.org.uk/def/dimension/flow                    | http://purl.org/linked-data/cube#dimension | Flow                    |           2 |
+| http://gss-data.org.uk/def/dimension/seasonal-adjustment     | http://purl.org/linked-data/cube#dimension | Seasonal Adjustment     |           1 |
+| http://purl.org/linked-data/cube#measureType                 | http://purl.org/linked-data/cube#dimension | measure type            |           1 |
+| http://purl.org/linked-data/sdmx/2009/attribute#unitMeasure  | http://purl.org/linked-data/cube#attribute | Unit of Measure         |           1 |
+
+Here we see that using a single dimension with highest cardinality
+(=refPeriod)= as a cursor is still likely to give us a rather large page
+size of roughly =58963= observations per page =14799852 / 251=
+observations; which is still likely too big.
+
+Instead we pick the two largest dimensions and cursor over every
+permutation of =refPeriod= and =trade-partner-geography=.  For this cube
+however combining =refPeriod= with =trade-partner-geography= will be a
+good compromise.
+
+*** Finding code metadata and the values for cursoring
+
+Largely this is the same query as before but without the
+COUNT/aggregation and with a different projection.
+
+Here we bind =?component= to the URI for =refPeriod=, however note that
+this query is generalised to also work for any component.  Whilst for
+finding a cursor we're only interested in dimensions, we will later
+also be in the metadata for all component values.  So it's worth
+repeating this process for each component returned in the previous
+query and storing the results for later.
+
+#+BEGIN_SRC sparql
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX qb: <http://purl.org/linked-data/cube#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX pmdqb: <http://publishmydata.com/def/qb/>
+
+SELECT ?compvalue ?label WHERE {
+  BIND(<http://gss-data.org.uk/data/gss_data/trade/ons-trade-in-goods> AS ?dataset)
+  BIND(<http://purl.org/linked-data/sdmx/2009/dimension#refPeriod> AS ?component)
+  ?dataset qb:structure/qb:component ?compspec .
+
+  ?compspec ?comp_type ?component ;
+            pmdqb:codesUsed / skos:member ?compvalue .
+
+  ?compvalue rdfs:label ?label .
+
+} ORDER BY ?compvalue
+LIMIT 10 # COMMENT THIS OUT WHEN RUNNING FOR REAL
+#+END_SRC
+
+#+RESULTS:
+| compvalue                                     |   label |
+|-----------------------------------------------+---------|
+| http://reference.data.gov.uk/id/month/1998-01 | 1998-01 |
+| http://reference.data.gov.uk/id/month/1998-02 | 1998-02 |
+| http://reference.data.gov.uk/id/month/1998-03 | 1998-03 |
+| http://reference.data.gov.uk/id/month/1998-04 | 1998-04 |
+| http://reference.data.gov.uk/id/month/1998-05 | 1998-05 |
+| http://reference.data.gov.uk/id/month/1998-06 | 1998-06 |
+| http://reference.data.gov.uk/id/month/1998-07 | 1998-07 |
+| http://reference.data.gov.uk/id/month/1998-08 | 1998-08 |
+| http://reference.data.gov.uk/id/month/1998-09 | 1998-09 |
+| http://reference.data.gov.uk/id/month/1998-10 | 1998-10 |
+
+Then for =trade-partner-geography=:
+
+#+BEGIN_SRC sparql
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX qb: <http://purl.org/linked-data/cube#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX pmdqb: <http://publishmydata.com/def/qb/>
+
+SELECT ?dimensionvalue ?label WHERE {
+  BIND(<http://gss-data.org.uk/data/gss_data/trade/ons-trade-in-goods> AS ?dataset)
+  BIND(<http://gss-data.org.uk/def/dimension/trade-partner-geography> AS ?dimension)
+  ?dataset qb:structure/qb:component ?compspec .
+
+  ?compspec ?comp_type ?dimension ;
+            pmdqb:codesUsed / skos:member ?dimensionvalue .
+  ?dimensionvalue rdfs:label ?label .
+} ORDER BY ?dimensionvalue
+LIMIT 10 # COMMENT THIS OUT WHEN RUNNING FOR REAL
+#+END_SRC
+
+#+RESULTS:
+| dimensionvalue                                             | label                |
+|------------------------------------------------------------+----------------------|
+| http://gss-data.org.uk/def/concept/ons-trade-areas-cord/AD | Andorra              |
+| http://gss-data.org.uk/def/concept/ons-trade-areas-cord/AE | United Arab Emirates |
+| http://gss-data.org.uk/def/concept/ons-trade-areas-cord/AF | Afghanistan          |
+| http://gss-data.org.uk/def/concept/ons-trade-areas-cord/AG | Antigua & Barbuda    |
+| http://gss-data.org.uk/def/concept/ons-trade-areas-cord/AI | Anguilla             |
+| http://gss-data.org.uk/def/concept/ons-trade-areas-cord/AL | Albania              |
+| http://gss-data.org.uk/def/concept/ons-trade-areas-cord/AM | Armenia              |
+| http://gss-data.org.uk/def/concept/ons-trade-areas-cord/AO | Angola               |
+| http://gss-data.org.uk/def/concept/ons-trade-areas-cord/AQ | Antarctica           |
+| http://gss-data.org.uk/def/concept/ons-trade-areas-cord/AR | Argentina            |
+
+** Using our cursor to paginate observations
+
+So now we can try and build a cursor for each permutation, by pairing
+the dimension property URI with the dimension value URI.  e.g. the
+first iteration would be on:
+<http://reference.data.gov.uk/id/month/1998-01> and
+<http://gss-data.org.uk/def/concept/ons-trade-areas-cord/AD> and can
+fetch the observation data one page at a time like this:
+
+#+BEGIN_SRC sparql
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX qb: <http://purl.org/linked-data/cube#>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX pmdqb: <http://publishmydata.com/def/qb/>
+
+SELECT ?obs ?component ?compvalue
+ WHERE {
+  ?obs qb:dataSet <http://gss-data.org.uk/data/gss_data/trade/ons-trade-in-goods> ;
+       # Constrain by the cursor
+       <http://gss-data.org.uk/def/dimension/trade-partner-geography> <http://gss-data.org.uk/def/concept/ons-trade-areas-cord/AD> ;
+       <http://purl.org/linked-data/sdmx/2009/dimension#refPeriod> <http://reference.data.gov.uk/id/month/2001-01> ;
+
+       # Select properties and their values
+       ?component ?compvalue .
+
+  # Discard some unnecessary properties...
+  FILTER(?component NOT IN (<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>, qb:dataSet))
+} ORDER BY ?obs # Not strictly necessary depending on how you want to group results
+LIMIT 10 ### Don't actually set a LIMIT here, this is only to show a short example of the output
+#+END_SRC
+
+#+RESULTS:
+| obs                                                                                                     | component                                                    | compvalue                                                        |
+|---------------------------------------------------------------------------------------------------------+--------------------------------------------------------------+------------------------------------------------------------------|
+| http://gss-data.org.uk/data/gss_data/trade/ons-trade-in-goods/AD/month/2001-01/exports/0/NSA/gbp-total  | http://gss-data.org.uk/def/dimension/trade-partner-geography | http://gss-data.org.uk/def/concept/ons-trade-areas-cord/AD       |
+| http://gss-data.org.uk/data/gss_data/trade/ons-trade-in-goods/AD/month/2001-01/exports/0/NSA/gbp-total  | http://gss-data.org.uk/def/dimension/product                 | http://gss-data.org.uk/def/concept/cord-sitc/0                   |
+| http://gss-data.org.uk/data/gss_data/trade/ons-trade-in-goods/AD/month/2001-01/exports/0/NSA/gbp-total  | http://gss-data.org.uk/def/dimension/seasonal-adjustment     | http://gss-data.org.uk/def/concept/seasonal-adjustments/NSA      |
+| http://gss-data.org.uk/data/gss_data/trade/ons-trade-in-goods/AD/month/2001-01/exports/0/NSA/gbp-total  | http://gss-data.org.uk/def/measure/gbp-total                 | 0.0E0                                                            |
+| http://gss-data.org.uk/data/gss_data/trade/ons-trade-in-goods/AD/month/2001-01/exports/0/NSA/gbp-total  | http://gss-data.org.uk/def/dimension/flow                    | http://gss-data.org.uk/def/concept/flow-directions/exports       |
+| http://gss-data.org.uk/data/gss_data/trade/ons-trade-in-goods/AD/month/2001-01/exports/0/NSA/gbp-total  | http://purl.org/linked-data/sdmx/2009/attribute#unitMeasure  | http://gss-data.org.uk/def/concept/measurement-units/gbp-million |
+| http://gss-data.org.uk/data/gss_data/trade/ons-trade-in-goods/AD/month/2001-01/exports/0/NSA/gbp-total  | http://purl.org/linked-data/sdmx/2009/dimension#refPeriod    | http://reference.data.gov.uk/id/month/2001-01                    |
+| http://gss-data.org.uk/data/gss_data/trade/ons-trade-in-goods/AD/month/2001-01/exports/0/NSA/gbp-total  | http://purl.org/linked-data/cube#measureType                 | http://gss-data.org.uk/def/measure/gbp-total                     |
+| http://gss-data.org.uk/data/gss_data/trade/ons-trade-in-goods/AD/month/2001-01/exports/00/NSA/gbp-total | http://gss-data.org.uk/def/dimension/trade-partner-geography | http://gss-data.org.uk/def/concept/ons-trade-areas-cord/AD       |
+| http://gss-data.org.uk/data/gss_data/trade/ons-trade-in-goods/AD/month/2001-01/exports/00/NSA/gbp-total | http://gss-data.org.uk/def/dimension/product                 | http://gss-data.org.uk/def/concept/cord-sitc/00                  |
+
+These results return the identifier for each =?obs= and their component
+and component values.  NOTE that the previous query does not request
+the labels for these inline.  This is because the set of reference
+data is already known, and has been assembled already with the
+previous queries.  If the query for each page were also to join these
+attributes also, it would be prohibitively slow on large cubes such as
+this.
+
+Hence it is much faster to pivot and assemble these results tables in
+code by:
+
+1. Loading each component table above into a single dictionary or
+   hashmap in memory.  And mapping the component/componentvalue URI to its
+   label (or other metadata).
+2. For each page (results query):
+3. Group the observation results by =?obs=
+4. For each property on each =?obs= looking up its label from the in
+   memory map of reference data.
+5. Generate a row of output for each =?obs=
+
+Obviously prior to this you will also want to have emitted a header
+row from each dimension.  The data for this row should have been
+acquired in the first steps.
+
+** Additional considerations
+
+NOTE also that you will likely also want to reliably determine which
+row contains the measure.  In this example the measure is the only
+scalar non-URI value; however it's worth noting that some cubes may in
+principle return other scalar properties for the =?obs= query.  Hence
+the most reliable way is to identify which of the cubes dimensions is
+the measure type.  This dimension will (for measure dimension cubes;
+which all these are), be identified with the URI =qb:measureType=
+(=http://purl.org/linked-data/cube#measureType=).  You will see this
+listed as a special dimension in the [[*Finding components][finding components]] step.
+
+
+The dimension values for this dimension will then always identify the
+measure properties in the observation table.
+
+e.g. in the previous results the URI for the property
+http://gss-data.org.uk/def/measure/gbp-total will be returned when
+executing the =?compvalue= query for =qb:measureType=:
+
+#+BEGIN_SRC sparql
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+PREFIX qb: <http://purl.org/linked-data/cube#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX pmdqb: <http://publishmydata.com/def/qb/>
+
+SELECT ?compvalue ?label WHERE {
+  BIND(<http://gss-data.org.uk/data/gss_data/trade/ons-trade-in-goods> AS ?dataset)
+  BIND(<http://purl.org/linked-data/cube#measureType> AS ?component)
+  ?dataset qb:structure/qb:component ?compspec .
+
+  ?compspec ?comp_type ?component ;
+            pmdqb:codesUsed / skos:member ?compvalue .
+
+  ?compvalue rdfs:label ?label .
+
+} ORDER BY ?compvalue
+#+END_SRC
+
+#+RESULTS:
+| compvalue                                    | label     |
+|----------------------------------------------+-----------|
+| http://gss-data.org.uk/def/measure/gbp-total | GBP Total |

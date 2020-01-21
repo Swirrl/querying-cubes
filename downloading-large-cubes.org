@@ -298,7 +298,28 @@ row from each dimension.  The data for this row should have been
 acquired in the first steps.
 
 ** Additional considerations
+*** Filtering non components
 
+Strictly speaking it is possible though unlikely that an observation
+/may/ contain non component properties.  That is properties that are not
+part of the Data Cube specification.
+
+Therefore in the interests of robustness it is worth considering
+[[https://en.wikipedia.org/wiki/Robustness_principle][Postel's law]] and being liberal in what you accept from others.
+
+In order to do this it is recommended that when building observation
+rows in the output you should allow for the fact that it is valid for
+the previous query to return predicates bound to =?component= that are
+not actually components (registered in the DSD).  Therefore it is
+advisable to ignore any rows in the observation results that contain
+=?component= URIs that were not listed in the initial cardinality query.
+
+This could be done through the addition of an additional constraint
+joining =?component= back to the DSD; however I would recommend applying
+this filtering in code, rather than risk complicating the query plan
+of a query that will be executed a lot.
+
+*** Finding the measures
 NOTE also that you will likely also want to reliably determine which
 row contains the measure.  In this example the measure is the only
 scalar non-URI value; however it's worth noting that some cubes may in

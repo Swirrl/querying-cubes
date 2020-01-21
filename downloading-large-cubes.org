@@ -254,7 +254,7 @@ SELECT ?obs ?component ?compvalue
        ?component ?compvalue .
 
   # Discard some unnecessary properties...
-  FILTER(?component NOT IN (<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>, qb:dataSet))
+  FILTER(?component NOT IN (rdf:type, qb:dataSet))
 } ORDER BY ?obs # Not strictly necessary depending on how you want to group results
 LIMIT 10 ### Don't actually set a LIMIT here, this is only to show a short example of the output
 #+END_SRC
